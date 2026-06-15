@@ -16,65 +16,68 @@ const COS_IMAGE_FAMILY = 'cos-stable';
 const COS_IMAGE_PROJECT = 'cos-cloud';
 
 function buildStartupScript(): string {
-  // All output is tagged so you can debug with:
-  //   gcloud compute ssh hello-app-<env> --zone=us-east1-b --tunnel-through-iap
-  //   journalctl -t hello-startup -f
+  // Debug from inside the VM with: cat /tmp/hello-startup.log
   return `#!/bin/bash
+LOGFILE=/tmp/hello-startup.log
 
-LOG() { echo "[hello-startup] $*" | tee >(logger -t hello-startup); }
+log() { echo "[$(date '+%H:%M:%S')] $*" | tee -a "$LOGFILE"; }
 
-LOG "=== startup begin ==="
+log "=== startup begin ==="
 
-# Wait for the Docker daemon (COS starts it as a service; give it up to 60s)
-LOG "Waiting for Docker daemon..."
-DOCKER_READY=0
+# ── 1. Wait for Docker daemon ───────────────────────────────────────────────
+log "Waiting for Docker daemon..."
 for i in $(seq 1 30); do
-  if docker info > /dev/null 2>&1; then
-    DOCKER_READY=1
-    LOG "Docker ready after $((i * 2))s"
-    break
-  fi
+  docker info > /dev/null 2>&1 && { log "Docker ready after $((i * 2))s"; break; }
   sleep 2
+  [ "$i" -eq 30 ] && { log "ERROR: Docker never started"; exit 1; }
 done
-if [ "$DOCKER_READY" -eq 0 ]; then
-  LOG "ERROR: Docker daemon did not start within 60s — aborting"
-  exit 1
-fi
 
 REGISTRY="${registryHost}"
 IMAGE="${imageUrl}"
 
-LOG "Configuring Docker credentials for $REGISTRY..."
-if ! gcloud auth configure-docker "$REGISTRY" --quiet; then
-  LOG "ERROR: gcloud auth configure-docker failed"
+# ── 2. Auth via metadata server (no gcloud PATH dependency) ─────────────────
+# On COS, gcloud is not in PATH during startup script execution.
+# The metadata server is always reachable and returns the VM SA token directly.
+log "Fetching SA token from metadata server..."
+TOKEN=$(curl -sf \\
+  "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token" \\
+  -H "Metadata-Flavor: Google" | cut -d'"' -f4)
+
+if [ -z "$TOKEN" ]; then
+  log "ERROR: metadata server returned empty token — check VM SA and cloud-platform scope"
   exit 1
 fi
 
-LOG "Pulling $IMAGE..."
-if ! docker pull "$IMAGE"; then
-  LOG "ERROR: docker pull failed — check that the image exists and the VM SA has roles/artifactregistry.reader"
+log "Logging in to $REGISTRY..."
+echo "$TOKEN" | docker login \\
+  --username oauth2accesstoken \\
+  --password-stdin \\
+  "https://$REGISTRY" >> "$LOGFILE" 2>&1 || { log "ERROR: docker login failed"; exit 1; }
+
+# ── 3. Pull image ────────────────────────────────────────────────────────────
+log "Pulling $IMAGE..."
+docker pull "$IMAGE" >> "$LOGFILE" 2>&1 || {
+  log "ERROR: docker pull failed — verify image tag exists and SA has roles/artifactregistry.reader"
   exit 1
-fi
+}
 
-LOG "Stopping any previous container..."
-docker stop hello-app 2>/dev/null || true
-docker rm   hello-app 2>/dev/null || true
+# ── 4. Run container ─────────────────────────────────────────────────────────
+log "Stopping existing container..."
+docker stop hello-app >> "$LOGFILE" 2>&1 || true
+docker rm   hello-app >> "$LOGFILE" 2>&1 || true
 
-LOG "Starting container on port ${appPort}..."
-# gcplogs driver omitted: it requires Cloud Logging API to be reachable before the
-# container starts, which races with network readiness on first boot.
+log "Starting container on port ${appPort}..."
 docker run -d \\
   --name hello-app \\
   --restart unless-stopped \\
   -p ${appPort}:${appPort} \\
   -e NODE_ENV=${environment} \\
   -e APP_VERSION=${imageTag} \\
-  "$IMAGE"
+  "$IMAGE" >> "$LOGFILE" 2>&1 || { log "ERROR: docker run failed"; exit 1; }
 
-LOG "Container status:"
-docker ps --filter name=hello-app --format "table {{.ID}}\\t{{.Status}}\\t{{.Ports}}"
-
-LOG "=== startup complete ==="
+log "Container status:"
+docker ps --filter name=hello-app --format "  ID={{.ID}} Status={{.Status}} Ports={{.Ports}}" | tee -a "$LOGFILE"
+log "=== startup complete ==="
 `;
 }
 
@@ -119,7 +122,12 @@ export function createInstance(
       app: 'hello-app',
     },
 
-    deletionProtection: environment === 'production',
+    deletionProtection: false, // enable once a load balancer sits in front
+  }, {
+    // Recreate the VM whenever the startup script changes (i.e. new image tag).
+    // Without this, Pulumi only updates the stored metadata; GCE never re-runs
+    // the script and the old container keeps serving the old image.
+    replaceOnChanges: ['metadataStartupScript'],
   });
 
   return instance;
