@@ -1,0 +1,313 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+# Cancel in-flight runs on the same branch — prevents two deploys racing.
+concurrency:
+  group: deploy-${{ github.ref }}
+  cancel-in-progress: false   # keep false: we never want a destroy mid-flight
+
+env:
+  GCP_PROJECT_ID: cverai
+  GCP_REGION: us-east1
+  REGISTRY: us-east1-docker.pkg.dev
+  IMAGE_NAME: us-east1-docker.pkg.dev/cverai/hello-app/hello-app
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 1 — Build Docker image and push to Artifact Registry
+# ─────────────────────────────────────────────────────────────────────────────
+jobs:
+  build-and-push:
+    name: Build & Push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write       # required for Workload Identity Federation
+    outputs:
+      image-tag: ${{ github.sha }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+          token_format: access_token
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: Login to Artifact Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: oauth2accesstoken
+          password: ${{ steps.auth.outputs.access_token }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: app
+          push: true
+          tags: |
+            ${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ env.IMAGE_NAME }}:latest
+          labels: |
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 2 — Provision staging infra and deploy
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-staging:
+    name: Deploy → Staging
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      app-url: ${{ steps.get-url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install infra dependencies
+        run: npm ci
+        working-directory: infra
+
+      # Select or create the ephemeral staging stack, then set all config.
+      # Pulumi.staging.yaml is .gitignored — config lives only in Pulumi Cloud.
+      - name: Configure staging stack
+        working-directory: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          npx pulumi stack select staging 2>/dev/null \
+            || npx pulumi stack init staging
+          npx pulumi config set gcp:project  "${{ env.GCP_PROJECT_ID }}"          --stack staging
+          npx pulumi config set gcp:region   "${{ env.GCP_REGION }}"              --stack staging
+          npx pulumi config set gcp:zone     "${{ env.GCP_REGION }}-b"            --stack staging
+          npx pulumi config set hello-app:imageTag "${{ needs.build-and-push.outputs.image-tag }}" --stack staging
+
+      - name: Pulumi up (staging)
+        uses: pulumi/actions@v5
+        with:
+          command: up
+          stack-name: staging
+          work-dir: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+      - name: Get staging app URL
+        id: get-url
+        working-directory: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          URL=$(npx pulumi stack output appUrl --stack staging)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Staging URL: $URL"
+
+      # VM boot + Docker pull on COS takes 3-5 minutes; wait up to 10 min.
+      - name: Wait for staging to be healthy
+        run: |
+          URL="${{ steps.get-url.outputs.url }}/health"
+          echo "Polling $URL (up to 10 min)..."
+          for i in $(seq 1 60); do
+            if curl -sf --max-time 5 "$URL" > /dev/null 2>&1; then
+              echo "Healthy after $((i * 10))s"
+              exit 0
+            fi
+            echo "  attempt $i/60 — waiting 10s..."
+            sleep 10
+          done
+          echo "Staging did not become healthy within 600s"
+          exit 1
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh "${{ steps.get-url.outputs.url }}"
+
+      - name: Write staging summary
+        run: |
+          {
+            echo "## Staging deployed"
+            echo ""
+            echo "| Key | Value |"
+            echo "| --- | ----- |"
+            echo "| URL | ${{ steps.get-url.outputs.url }} |"
+            echo "| Image | \`${{ needs.build-and-push.outputs.image-tag }}\` |"
+            echo "| Commit | \`${{ github.sha }}\` |"
+            echo ""
+            echo "> Approve the **production** environment below to promote and destroy staging."
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 3 — Promote to production (blocked until a reviewer approves)
+#
+# Set up: GitHub → Settings → Environments → "production"
+#   • Add required reviewers
+#   • Restrict to branch: main
+# ─────────────────────────────────────────────────────────────────────────────
+  deploy-production:
+    name: Deploy → Production
+    needs: [build-and-push, deploy-staging]
+    runs-on: ubuntu-latest
+    environment: production      # ← approval gate lives here
+    permissions:
+      contents: read
+      id-token: write
+    outputs:
+      app-url: ${{ steps.get-url.outputs.url }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install infra dependencies
+        run: npm ci
+        working-directory: infra
+
+      - name: Update production image tag
+        working-directory: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          npx pulumi config set hello-app:imageTag \
+            "${{ needs.build-and-push.outputs.image-tag }}" \
+            --stack production
+
+      - name: Pulumi up (production)
+        uses: pulumi/actions@v5
+        with:
+          command: up
+          stack-name: production
+          work-dir: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+      - name: Get production app URL
+        id: get-url
+        working-directory: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: |
+          URL=$(npx pulumi stack output appUrl --stack production)
+          echo "url=$URL" >> "$GITHUB_OUTPUT"
+          echo "Production URL: $URL"
+
+      - name: Verify production health
+        run: |
+          URL="${{ steps.get-url.outputs.url }}/health"
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 5 "$URL" > /dev/null 2>&1; then
+              echo "Production healthy"
+              exit 0
+            fi
+            sleep 10
+          done
+          echo "Production health check failed"
+          exit 1
+
+      - name: Run smoke tests
+        run: bash scripts/smoke-test.sh "${{ steps.get-url.outputs.url }}"
+
+      - name: Write production summary
+        run: |
+          {
+            echo "## Production deployed"
+            echo ""
+            echo "| Key | Value |"
+            echo "| --- | ----- |"
+            echo "| URL | ${{ steps.get-url.outputs.url }} |"
+            echo "| Image | \`${{ needs.build-and-push.outputs.image-tag }}\` |"
+            echo "| Approved by | ${{ github.actor }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+# ─────────────────────────────────────────────────────────────────────────────
+# JOB 4 — Destroy the ephemeral staging environment
+# Runs only after production is healthy. If prod deploy fails, staging survives
+# so engineers can compare the two environments for debugging.
+# ─────────────────────────────────────────────────────────────────────────────
+  destroy-staging:
+    name: Destroy Staging
+    needs: deploy-production
+    runs-on: ubuntu-latest
+    if: success()
+    permissions:
+      contents: read
+      id-token: write
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - id: auth
+        name: Authenticate to GCP (WIF)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
+          service_account: ${{ secrets.GCP_SA_EMAIL }}
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '22'
+          cache: npm
+          cache-dependency-path: infra/package-lock.json
+
+      - name: Install infra dependencies
+        run: npm ci
+        working-directory: infra
+
+      # Remove the deletion_protection label Pulumi might have set on prod
+      # (staging has deletion_protection=false so this is safe).
+      - name: Destroy staging stack
+        uses: pulumi/actions@v5
+        with:
+          command: destroy
+          stack-name: staging
+          work-dir: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+
+      # Remove the empty stack record from Pulumi Cloud to keep history clean.
+      - name: Remove staging stack record
+        working-directory: infra
+        env:
+          PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        run: npx pulumi stack rm staging --yes
+
+      - name: Write cleanup summary
+        run: |
+          echo "## Staging destroyed" >> "$GITHUB_STEP_SUMMARY"
+          echo "Ephemeral staging infrastructure has been removed." >> "$GITHUB_STEP_SUMMARY"

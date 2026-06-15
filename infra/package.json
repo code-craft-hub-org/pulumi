@@ -1,0 +1,13 @@
+{
+  "name": "hello-app-infra",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "@pulumi/gcp": "^7.38.0",
+    "@pulumi/pulumi": "^3.136.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.0.0",
+    "typescript": "^5.5.4"
+  }
+}
