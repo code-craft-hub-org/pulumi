@@ -85,14 +85,18 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: infra/package-lock.json
+          cache: pnpm
+          cache-dependency-path: infra/pnpm-lock.yaml
 
       - name: Install infra dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
         working-directory: infra
 
       # Select or create the ephemeral staging stack, then set all config.
@@ -189,14 +193,18 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: infra/package-lock.json
+          cache: pnpm
+          cache-dependency-path: infra/pnpm-lock.yaml
 
       - name: Install infra dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
         working-directory: infra
 
       - name: Update production image tag
@@ -279,14 +287,18 @@ jobs:
           workload_identity_provider: ${{ secrets.GCP_WIF_PROVIDER }}
           service_account: ${{ secrets.GCP_SA_EMAIL }}
 
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
       - uses: actions/setup-node@v4
         with:
           node-version: '22'
-          cache: npm
-          cache-dependency-path: infra/package-lock.json
+          cache: pnpm
+          cache-dependency-path: infra/pnpm-lock.yaml
 
       - name: Install infra dependencies
-        run: npm ci
+        run: pnpm install --frozen-lockfile
         working-directory: infra
 
       # Remove the deletion_protection label Pulumi might have set on prod
