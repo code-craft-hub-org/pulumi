@@ -1,25 +1,30 @@
-# ── build stage ──────────────────────────────────────────────────────────────
-FROM node:22-alpine AS builder
+# ── production deps (isolated so builder's devDeps don't bleed in) ────────────
+FROM node:22-alpine AS deps
+RUN corepack enable
 WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile --prod
 
-COPY package*.json ./
-RUN npm ci
-
+# ── build stage ───────────────────────────────────────────────────────────────
+FROM node:22-alpine AS builder
+RUN corepack enable
+WORKDIR /app
+COPY package.json pnpm-lock.yaml ./
+RUN pnpm install --frozen-lockfile
 COPY tsconfig.json ./
 COPY src/ ./src/
-RUN npm run build
+RUN pnpm run build
 
-# ── production stage ──────────────────────────────────────────────────────────
+# ── runtime stage ─────────────────────────────────────────────────────────────
 FROM node:22-alpine AS runner
 
 RUN addgroup -g 1001 -S nodejs && adduser -S nodejs -u 1001
 
 WORKDIR /app
 
-COPY package*.json ./
-RUN npm ci --omit=dev && npm cache clean --force
-
-COPY --from=builder --chown=nodejs:nodejs /app/dist ./dist
+COPY --from=deps    --chown=nodejs:nodejs /app/node_modules ./node_modules
+COPY --from=builder --chown=nodejs:nodejs /app/dist         ./dist
+COPY                --chown=nodejs:nodejs package.json      ./
 
 USER nodejs
 
