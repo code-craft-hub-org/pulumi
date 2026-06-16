@@ -1,0 +1,4 @@
+node_modules/
+dist/
+# Staging stack config is ephemeral — set entirely by CI, never committed.
+Pulumi.staging.yaml

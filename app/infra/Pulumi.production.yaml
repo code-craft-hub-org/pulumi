@@ -1,0 +1,5 @@
+config:
+  gcp:project: cverai
+  gcp:region: us-east1
+  gcp:zone: us-east1-b
+  hello-app:imageTag: latest
